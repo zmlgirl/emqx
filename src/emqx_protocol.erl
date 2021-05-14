@@ -428,7 +428,7 @@ process(?CONNECT_PACKET(
                               {?RC_SUCCESS, SP, PState4};
                           {error, Error} ->
                               ?LOG(error, "Failed to open session: ~p", [Error]),
-                              {?RC_UNSPECIFIED_ERROR, PState1#pstate{credentials = Credentials0}}
+                              {?RC_NOT_AUTHORIZED, PState1#pstate{credentials = Credentials0}}
                       end;
                   {error, Reason} ->
                       ?LOG(warning, "Client ~s (Username: '~s') login failed for ~p", [NewClientId, Username, Reason]),
