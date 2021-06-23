@@ -26,14 +26,19 @@
 
 %% Trie APIs
 -export([ insert/1
+        , insert_session/1
         , match/1
+        , match_session/1
         , delete/1
+        , delete_session/1
         , put_compaction_flag/1
         , put_default_compaction_flag/0
         ]).
 
 -export([ empty/0
+        , empty_session/0
         , lock_tables/0
+        , lock_session_tables/0
         ]).
 
 -ifdef(TEST).
@@ -42,6 +47,7 @@
 -endif.
 
 -define(TRIE, emqx_trie).
+-define(SESSION_TRIE, emqx_session_trie).
 -define(PREFIX(Prefix), {Prefix, 0}).
 -define(TOPIC(Topic), {Topic, 1}).
 
@@ -77,9 +83,16 @@ mnesia(boot) ->
                 {record_name, ?TRIE},
                 {attributes, record_info(fields, ?TRIE)},
                 {type, ordered_set},
+                {storage_properties, StoreProps}]),
+    ok = ekka_mnesia:create_table(?SESSION_TRIE, [
+                {ram_copies, [node()]},
+                {record_name, ?TRIE},
+                {attributes, record_info(fields, ?TRIE)},
+                {type, ordered_set},
                 {storage_properties, StoreProps}]);
 mnesia(copy) ->
     %% Copy topics table
+    ok = ekka_mnesia:copy_table(?SESSION_TRIE, ram_copies),
     ok = ekka_mnesia:copy_table(?TRIE, ram_copies).
 
 %%--------------------------------------------------------------------
@@ -89,24 +102,46 @@ mnesia(copy) ->
 %% @doc Insert a topic filter into the trie.
 -spec(insert(emqx_topic:topic()) -> ok).
 insert(Topic) when is_binary(Topic) ->
+    insert(Topic, ?TRIE).
+
+-spec(insert_session(emqx_topic:topic()) -> ok).
+insert_session(Topic) when is_binary(Topic) ->
+    insert(Topic, ?SESSION_TRIE).
+
+insert(Topic, Trie) when is_binary(Topic) ->
     {TopicKey, PrefixKeys} = make_keys(Topic),
-    case mnesia:wread({?TRIE, TopicKey}) of
+    case mnesia:wread({Trie, TopicKey}) of
         [_] -> ok; %% already inserted
-        [] -> lists:foreach(fun insert_key/1, [TopicKey | PrefixKeys])
+        [] -> lists:foreach(fun(Key) -> insert_key(Key, Trie) end, [TopicKey | PrefixKeys])
     end.
 
 %% @doc Delete a topic filter from the trie.
 -spec(delete(emqx_topic:topic()) -> ok).
 delete(Topic) when is_binary(Topic) ->
+    delete(Topic, ?TRIE).
+
+%% @doc Delete a topic filter from the trie.
+-spec(delete_session(emqx_topic:topic()) -> ok).
+delete_session(Topic) when is_binary(Topic) ->
+    delete(Topic, ?SESSION_TRIE).
+
+delete(Topic, Trie) when is_binary(Topic) ->
     {TopicKey, PrefixKeys} = make_keys(Topic),
-    case [] =/= mnesia:wread({?TRIE, TopicKey}) of
-        true -> lists:foreach(fun delete_key/1, [TopicKey | PrefixKeys]);
+    case [] =/= mnesia:wread({Trie, TopicKey}) of
+        true -> lists:foreach(fun(Key) -> delete_key(Key, Trie) end, [TopicKey | PrefixKeys]);
         false -> ok
     end.
 
 %% @doc Find trie nodes that matchs the topic name.
 -spec(match(emqx_topic:topic()) -> list(emqx_topic:topic())).
 match(Topic) when is_binary(Topic) ->
+    match(Topic, ?TRIE).
+
+-spec(match_session(emqx_topic:topic()) -> list(emqx_topic:topic())).
+match_session(Topic) when is_binary(Topic) ->
+    match(Topic, ?SESSION_TRIE).
+
+match(Topic, Trie) when is_binary(Topic) ->
     Words = emqx_topic:words(Topic),
     case emqx_topic:wildcard(Words) of
         true ->
@@ -119,16 +154,25 @@ match(Topic) when is_binary(Topic) ->
             %% Such clients will get disconnected.
             [];
         false ->
-            do_match(Words)
+            do_match(Words, Trie)
     end.
 
 %% @doc Is the trie empty?
 -spec(empty() -> boolean()).
-empty() -> ets:first(?TRIE) =:= '$end_of_table'.
+empty() -> empty(?TRIE).
+
+empty_session() ->
+    empty(?SESSION_TRIE).
+
+empty(Trie) -> ets:first(Trie) =:= '$end_of_table'.
 
 -spec lock_tables() -> ok.
 lock_tables() ->
     mnesia:write_lock_table(?TRIE).
+
+-spec lock_session_tables() -> ok.
+lock_session_tables() ->
+    mnesia:write_lock_table(?SESSION_TRIE).
 
 %%--------------------------------------------------------------------
 %% Internal functions
@@ -177,70 +221,70 @@ make_prefixes([H | T], Prefix0, Acc0) ->
     Acc = [Prefix | Acc0],
     make_prefixes(T, Prefix, Acc).
 
-insert_key(Key) ->
-    T = case mnesia:wread({?TRIE, Key}) of
+insert_key(Key, Trie) ->
+    T = case mnesia:wread({Trie, Key}) of
             [#?TRIE{count = C} = T1] ->
                 T1#?TRIE{count = C + 1};
              [] ->
                 #?TRIE{key = Key, count = 1}
          end,
-    ok = mnesia:write(T).
+    ok = mnesia:write(Trie, T, write).
 
-delete_key(Key) ->
-    case mnesia:wread({?TRIE, Key}) of
+delete_key(Key, Trie) ->
+    case mnesia:wread({Trie, Key}) of
         [#?TRIE{count = C} = T] when C > 1 ->
-            ok = mnesia:write(T#?TRIE{count = C - 1});
+            ok = mnesia:write(Trie, T#?TRIE{count = C - 1}, write);
         [_] ->
-            ok = mnesia:delete(?TRIE, Key, write);
+            ok = mnesia:delete(Trie, Key, write);
         [] ->
             ok
     end.
 
 %% micro-optimization: no need to lookup when topic is not wildcard
 %% because we only insert wildcards to emqx_trie
-lookup_topic(_Topic, false) -> [];
-lookup_topic(Topic, true) -> lookup_topic(Topic).
+lookup_topic(_Topic,_Trie, false) -> [];
+lookup_topic(Topic, Trie, true) -> lookup_topic(Topic, Trie).
 
-lookup_topic(Topic) when is_binary(Topic) ->
-    case ets:lookup(?TRIE, ?TOPIC(Topic)) of
+lookup_topic(Topic, Trie) when is_binary(Topic) ->
+    case ets:lookup(Trie, ?TOPIC(Topic)) of
         [#?TRIE{count = C}] -> [Topic || C > 0];
         [] -> []
     end.
 
-has_prefix(empty) -> true; %% this is the virtual tree root
-has_prefix(Prefix) ->
-    case ets:lookup(?TRIE, ?PREFIX(Prefix)) of
+has_prefix(empty, _Trie) -> true; %% this is the virtual tree root
+has_prefix(Prefix, Trie) ->
+    case ets:lookup(Trie, ?PREFIX(Prefix)) of
         [#?TRIE{count = C}] -> C > 0;
         [] -> false
     end.
 
-do_match([<<"$", _/binary>> = Prefix | Words]) ->
+do_match([<<"$", _/binary>> = Prefix | Words], Trie) ->
     %% For topics having dollar sign prefix,
     %% we do not match root level + or #,
     %% fast forward to the next level.
     case Words =:= [] of
-        true -> lookup_topic(Prefix);
+        true -> lookup_topic(Prefix, Trie);
         false -> []
-    end ++ do_match(Words, Prefix);
-do_match(Words) ->
-    do_match(Words, empty).
+    end ++ do_match(Words, Prefix, Trie);
+do_match(Words, Trie) ->
+    do_match(Words, empty, Trie).
 
-do_match(Words, Prefix) ->
+do_match(Words, Prefix, Trie) ->
     case is_compact() of
-        true -> match_compact(Words, Prefix, false, []);
-        false -> match_no_compact(Words, Prefix, false, [])
+        true -> match_compact(Words, Prefix, Trie, false, []);
+        false -> match_no_compact(Words, Prefix, Trie, false, [])
     end.
 
-match_no_compact([], Topic, IsWildcard, Acc) ->
-    'match_#'(Topic) ++ %% try match foo/+/# or foo/bar/#
-    lookup_topic(Topic, IsWildcard) ++ %% e.g. foo/+
+match_no_compact([], Topic, Trie, IsWildcard, Acc) ->
+    'match_#'(Topic, Trie) ++ %% try match foo/+/# or foo/bar/#
+    lookup_topic(Topic, Trie, IsWildcard) ++ %% e.g. foo/+
     Acc;
-match_no_compact([Word | Words], Prefix, IsWildcard, Acc0) ->
-    case has_prefix(Prefix) of
+match_no_compact([Word | Words], Prefix, Trie, IsWildcard, Acc0) ->
+    case has_prefix(Prefix, Trie) of
         true ->
-            Acc1 = 'match_#'(Prefix) ++ Acc0,
-            Acc = match_no_compact(Words, join(Prefix, '+'), true, Acc1),
-            match_no_compact(Words, join(Prefix, Word), IsWildcard, Acc);
+            Acc1 = 'match_#'(Prefix, Trie) ++ Acc0,
+            Acc = match_no_compact(Words, join(Prefix, '+'), Trie, true, Acc1),
+            match_no_compact(Words, join(Prefix, Word), Trie, IsWildcard, Acc);
         false ->
             %% non-compact paths in database
             %% if there is no prefix matches the current topic prefix
@@ -257,26 +301,26 @@ match_no_compact([Word | Words], Prefix, IsWildcard, Acc0) ->
             Acc0
     end.
 
-match_compact([], Topic, IsWildcard, Acc) ->
-    'match_#'(Topic) ++ %% try match foo/bar/#
-    lookup_topic(Topic, IsWildcard) ++ %% try match foo/bar
+match_compact([], Topic, Trie, IsWildcard, Acc) ->
+    'match_#'(Topic, Trie) ++ %% try match foo/bar/#
+    lookup_topic(Topic, Trie, IsWildcard) ++ %% try match foo/bar
     Acc;
-match_compact([Word | Words], Prefix, IsWildcard, Acc0) ->
-    Acc1 = 'match_#'(Prefix) ++ Acc0,
-    Acc = match_compact(Words, join(Prefix, Word), IsWildcard, Acc1),
+match_compact([Word | Words], Prefix, Trie, IsWildcard, Acc0) ->
+    Acc1 = 'match_#'(Prefix, Trie) ++ Acc0,
+    Acc = match_compact(Words, join(Prefix, Word), Trie, IsWildcard, Acc1),
     WildcardPrefix = join(Prefix, '+'),
     %% go deeper to match current_prefix/+ only when:
     %% 1. current word is the last
     %% OR
     %% 2. there is a prefix = 'current_prefix/+'
-    case Words =:= [] orelse has_prefix(WildcardPrefix) of
-        true -> match_compact(Words, WildcardPrefix, true, Acc);
+    case Words =:= [] orelse has_prefix(WildcardPrefix, Trie) of
+        true -> match_compact(Words, WildcardPrefix, Trie, true, Acc);
         false -> Acc
     end.
 
-'match_#'(Prefix) ->
+'match_#'(Prefix, Trie) ->
     MlTopic = join(Prefix, '#'),
-    lookup_topic(MlTopic).
+    lookup_topic(MlTopic, Trie).
 
 is_compact() ->
     case persistent_term:get({?MODULE, compaction}, undefined) of

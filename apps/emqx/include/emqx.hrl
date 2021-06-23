@@ -26,6 +26,7 @@
 -define(COMMON_SHARD, emqx_common_shard).
 -define(SHARED_SUB_SHARD, emqx_shared_sub_shard).
 -define(MOD_DELAYED_SHARD, emqx_delayed_shard).
+-define(PERSISTENT_SESSION_SHARD, emqx_persistent_session_shart).
 
 %%--------------------------------------------------------------------
 %% Banner
@@ -95,7 +96,7 @@
 
 -record(route, {
           topic :: binary(),
-          dest  :: node() | {binary(), node()}
+          dest  :: node() | {binary(), node()} | binary()
          }).
 
 %%--------------------------------------------------------------------

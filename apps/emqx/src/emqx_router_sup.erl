@@ -39,7 +39,13 @@ init([]) ->
                             ),
 
     %% Router pool
-    RouterPool = emqx_pool_sup:spec([router_pool, hash,
+    RouterPool = emqx_pool_sup:spec(router_pool,
+                                    [router_pool, hash,
                                      {emqx_router, start_link, []}]),
-    {ok, {{one_for_all, 0, 1}, [Helper, RouterPool]}}.
+
+    %% TODO: Should this be optional?
+    SessionRouterPool = emqx_pool_sup:spec(session_router_pool,
+                                           [session_router_pool, hash,
+                                            {emqx_session_router, start_link, []}]),
+    {ok, {{one_for_all, 0, 1}, [Helper, RouterPool, SessionRouterPool]}}.
 

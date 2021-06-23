@@ -229,13 +229,14 @@ open_session(false, ClientInfo = #{clientid := ClientId}, ConnInfo) ->
     ResumeStart = fun(_) ->
                       case takeover_session(ClientId) of
                           {ok, Session} ->
-                              %% TODO: Any messages in the mean time was lost.
                               ok = emqx_session:resume(ClientInfo, Session),
                               emqx_session:db_put(ClientId, EI, Session),
+                              Pendings = [{deliver, emqx_message:topic(Msg), Msg}
+                                          || Msg <- emqx_session_router:pending(ClientId)],
                               register_channel(ClientId, Self, ConnInfo),
                               {ok, #{session  => Session,
                                      present  => true,
-                                     pendings => []}};
+                                     pendings => Pendings}};
                           {ok, ConnMod, ChanPid, Session} ->
                               ok = emqx_session:resume(ClientInfo, Session),
                               emqx_session:db_put(ClientId, EI, Session),

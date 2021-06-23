@@ -206,6 +206,7 @@ publish(Msg) when is_record(Msg, message) ->
             ?LOG(notice, "Stop publishing: ~s", [emqx_message:format(Msg)]),
             [];
         Msg1 = #message{topic = Topic} ->
+            emqx_session_router:persist(Msg1),
             route(aggre(emqx_router:match_routes(Topic)), delivery(Msg1))
     end.
 

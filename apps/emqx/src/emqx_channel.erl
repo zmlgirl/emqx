@@ -730,8 +730,14 @@ maybe_update_expiry_interval(_Properties, Channel) -> Channel.
 handle_deliver(Delivers, Channel = #channel{conn_state = disconnected,
                                             session    = Session,
                                             clientinfo = #{clientid := ClientId}}) ->
-    NSession = emqx_session:enqueue(ignore_local(maybe_nack(Delivers), ClientId, Session), Session),
-    {ok, set_session(NSession, Channel)};
+    Delivers1 = maybe_nack(Delivers),
+    Delivers2 = ignore_local(Delivers1, ClientId, Session),
+    NSession = emqx_session:enqueue(Delivers2, Session),
+    NChannel = set_session(NSession, Channel),
+    %% We consider queued/dropped messages as delivered since they are now in the session state.
+    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Delivers],
+    emqx_session_router:delivered(ClientId, MsgIds),
+    {ok, NChannel};
 
 handle_deliver(Delivers, Channel = #channel{takeover = true,
                                             pendings = Pendings,
@@ -741,10 +747,19 @@ handle_deliver(Delivers, Channel = #channel{takeover = true,
     {ok, Channel#channel{pendings = NPendings}};
 
 handle_deliver(Delivers, Channel = #channel{session = Session,
-                                            clientinfo = #{clientid := ClientId}}) ->
+                                            clientinfo = #{clientid := ClientId},
+                                            conninfo = #{expiry_interval := ExpiryInterval}
+                                           }) ->
     case emqx_session:deliver(ignore_local(Delivers, ClientId, Session), Session) of
         {ok, Publishes, NSession} ->
             NChannel = set_session(NSession, Channel),
+            case ExpiryInterval > 0 of
+                true ->
+                    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Delivers],
+                    emqx_session_router:delivered(ClientId, MsgIds);
+                false ->
+                    ignore
+            end,
             handle_out(publish, Publishes, ensure_timer(retry_timer, NChannel));
         {ok, NSession} ->
             {ok, set_session(NSession, Channel)}
@@ -1587,8 +1602,12 @@ maybe_resume_session(#channel{resuming = false}) ->
     ignore;
 maybe_resume_session(#channel{session  = Session,
                               resuming = true,
-                              pendings = Pendings}) ->
+                              pendings = Pendings,
+                              clientinfo = #{clientid := ClientId}}) ->
     {ok, Publishes, Session1} = emqx_session:replay(Session),
+    %% We consider queued/dropped messages as delivered since they are now in the session state.
+    MsgIds = [emqx_message:id(Msg) || {deliver, _, Msg} <- Pendings],
+    emqx_session_router:delivered(ClientId, MsgIds),
     case emqx_session:deliver(Pendings, Session1) of
         {ok, Session2} ->
             {ok, Publishes, Session2};

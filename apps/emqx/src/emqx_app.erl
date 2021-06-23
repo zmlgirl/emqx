@@ -33,6 +33,7 @@
                      , ?SHARED_SUB_SHARD
                      , ?RULE_ENGINE_SHARD
                      , ?MOD_DELAYED_SHARD
+                     , ?PERSISTENT_SESSION_SHARD
                      ]).
 
 -include("emqx_release.hrl").
