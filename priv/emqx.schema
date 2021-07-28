@@ -2271,9 +2271,14 @@ end}.
      sticky, %% pick a random subscriber and stick to it
      hash, %% hash client ID to a group member
      hash_clientid,
-     hash_topic
+     hash_topic,
+     hash_message
     ]}}
 ]}.
+
+{mapping, "broker.shared_sub_hash_topic_path_mapping", "emqx.shared_sub_hash_topic_path_mapping", [
+  {datatype, string}]
+ }.
 
 %% @doc Enable or disable shared dispatch acknowledgement for QoS1 and QoS2 messages
 {mapping, "broker.shared_dispatch_ack_enabled", "emqx.shared_dispatch_ack_enabled",

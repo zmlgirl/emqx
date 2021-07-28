@@ -65,6 +65,7 @@
                   | sticky
                   | hash %% same as hash_clientid, backward compatible
                   | hash_clientid
+                  | hash_message
                   | hash_topic.
 
 -define(SERVER, ?MODULE).
@@ -117,11 +118,12 @@ record(Group, Topic, SubPid) ->
 -spec(dispatch(emqx_topic:group(), emqx_topic:topic(), emqx_types:delivery())
       -> emqx_types:deliver_result()).
 dispatch(Group, Topic, Delivery) ->
+    ?LOG(info, "GROUP ~p Topic:~p", [Group, Topic]),
     dispatch(Group, Topic, Delivery, _FailedSubs = []).
 
 dispatch(Group, Topic, Delivery = #delivery{message = Msg}, FailedSubs) ->
     #message{from = ClientId, topic = SourceTopic} = Msg,
-    case pick(strategy(), ClientId, SourceTopic, Group, Topic, FailedSubs) of
+    case pick(strategy(), ClientId, SourceTopic, Group, Topic, FailedSubs, Msg#message.payload) of
         false ->
             {error, no_subscribers};
         {Type, SubPid} ->
@@ -235,7 +237,7 @@ maybe_ack(Msg) ->
             without_ack_ref(Msg)
     end.
 
-pick(sticky, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
+pick(sticky, ClientId, SourceTopic, Group, Topic, FailedSubs, Msg) ->
     Sub0 = erlang:get({shared_sub_sticky, Group, Topic}),
     case is_active_sub(Sub0, FailedSubs) of
         true ->
@@ -244,15 +246,15 @@ pick(sticky, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
             {fresh, Sub0};
         false ->
             %% randomly pick one for the first message
-            {Type, Sub} = do_pick(random, ClientId, SourceTopic, Group, Topic, [Sub0 | FailedSubs]),
+            {Type, Sub} = do_pick(random, ClientId, SourceTopic, Group, Topic, [Sub0 | FailedSubs], Msg),
             %% stick to whatever pick result
             erlang:put({shared_sub_sticky, Group, Topic}, Sub),
             {Type, Sub}
     end;
-pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
-    do_pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs).
+pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs, Msg) ->
+    do_pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs, Msg).
 
-do_pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
+do_pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs, Msg) ->
     All = subscribers(Group, Topic),
     case All -- FailedSubs of
         [] when All =:= [] ->
@@ -260,33 +262,71 @@ do_pick(Strategy, ClientId, SourceTopic, Group, Topic, FailedSubs) ->
             false;
         [] ->
             %% All offline? pick one anyway
-            {retry, pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, All)};
+            {retry, pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, All, Msg)};
         Subs ->
             %% More than one available
-            {fresh, pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, Subs)}
+            {fresh, pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, Subs, Msg)}
     end.
 
-pick_subscriber(_Group, _Topic, _Strategy, _ClientId, _SourceTopic, [Sub]) -> Sub;
-pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, Subs) ->
-    Nth = do_pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, length(Subs)),
+pick_subscriber(_Group, _Topic, _Strategy, _ClientId, _SourceTopic, [Sub], _Msg) ->
+    Sub;
+pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, Subs, Msg) ->
+    Nth = do_pick_subscriber(Group, Topic, Strategy, ClientId, SourceTopic, length(Subs), Msg),
     lists:nth(Nth, Subs).
 
-do_pick_subscriber(_Group, _Topic, random, _ClientId, _SourceTopic, Count) ->
+do_pick_subscriber(_Group, _Topic, random, _ClientId, _SourceTopic, Count, _Msg) ->
     rand:uniform(Count);
-do_pick_subscriber(Group, Topic, hash, ClientId, SourceTopic, Count) ->
+do_pick_subscriber(Group, Topic, hash, ClientId, SourceTopic, Count, Msg) ->
     %% backward compatible
-    do_pick_subscriber(Group, Topic, hash_clientid, ClientId, SourceTopic, Count);
-do_pick_subscriber(_Group, _Topic, hash_clientid, ClientId, _SourceTopic, Count) ->
+    do_pick_subscriber(Group, Topic, hash_clientid, ClientId, SourceTopic, Count, Msg);
+do_pick_subscriber(_Group, _Topic, hash_clientid, ClientId, _SourceTopic, Count, _Msg) ->
     1 + erlang:phash2(ClientId) rem Count;
-do_pick_subscriber(_Group, _Topic, hash_topic, _ClientId, SourceTopic, Count) ->
+do_pick_subscriber(_Group, _Topic, hash_topic, _ClientId, SourceTopic, Count, _Msg) ->
     1 + erlang:phash2(SourceTopic) rem Count;
-do_pick_subscriber(Group, Topic, round_robin, _ClientId, _SourceTopic, Count) ->
+do_pick_subscriber(_Group, _Topic, hash_message, ClientId, SourceTopic, Count, Msg) ->
+    try
+        case hash_topic_match(SourceTopic, maps:iterator(topic_mapping())) of
+            null ->
+                %% 映射失败
+                1 + erlang:phash2(ClientId) rem Count;
+            JsonPath ->
+                case emqx_jsonpath:search(JsonPath, Msg) of
+                    undefined ->
+                        1 + erlang:phash2(ClientId) rem Count;
+                    Term ->
+                        1 + erlang:phash2(Term) rem Count
+                end
+        end
+    catch
+        error:ErrorReason ->
+            ?DEBUG("parse json error ~p ", [ErrorReason]),
+            1 + erlang:phash2(ClientId) rem Count
+    end;
+do_pick_subscriber(Group, Topic, round_robin, _ClientId, _SourceTopic, Count, _Msg) ->
     Rem = case erlang:get({shared_sub_round_robin, Group, Topic}) of
               undefined -> rand:uniform(Count) - 1;
               N -> (N + 1) rem Count
           end,
     _ = erlang:put({shared_sub_round_robin, Group, Topic}, Rem),
     Rem + 1.
+
+topic_mapping() ->
+    emqx_json:decode(emqx:get_env(shared_sub_hash_topic_path_mapping, {}), [return_maps]).
+
+hash_topic_match(StringTopic, Iterator) ->
+    case maps:next(Iterator) of
+        {K, V, NextIter} ->
+            case string_match(StringTopic, K) of
+                true -> V;
+                false -> hash_topic_match(StringTopic, NextIter)
+            end;
+        none -> null
+    end.
+string_match(String, Pattern) ->
+    case string:find(String, Pattern) of
+        nomatch -> false;
+        _ -> true
+    end.
 
 subscribers(Group, Topic) ->
     ets:select(?TAB, [{{emqx_shared_subscription, Group, Topic, '$1'}, [], ['$1']}]).
