@@ -122,3 +122,11 @@ safe_encode_decode(Term) ->
         {ok, {NTerm}} -> NTerm;
         {ok, NTerm}   -> NTerm
     end.
+
+jsonpath() ->
+    JsonText = <<"{\"bool\":true,\"int\":10,\"foo\":\"bar\",\"alarmResult\": {\"alarmTime\":14, \"alarmValue\": \"HIGH\"}}}">>,
+    JsonPath = <<"$.alarmResult.alarmValue">>,
+    case emqx_json:jsonpath(emqx_json:decode(JsonText), JsonPath) of
+        {ok, Term} -> Term;
+        {error, Reason} -> Reason
+    end.

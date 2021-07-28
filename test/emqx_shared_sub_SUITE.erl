@@ -216,6 +216,43 @@ t_hash_topic(_) ->
     emqtt:stop(ConnPid2),
     ok.
 
+t_hash_message(_) ->
+    ok = ensure_config(hash_topic, false, topic_parse_pattern),
+    ClientId1 = <<"ClientId1">>,
+    ClientId2 = <<"ClientId2">>,
+    {ok, ConnPid1} = emqtt:start_link([{clientid, ClientId1}]),
+    {ok, _} = emqtt:connect(ConnPid1),
+    {ok, ConnPid2} = emqtt:start_link([{clientid, ClientId2}]),
+    {ok, _} = emqtt:connect(ConnPid2),
+
+    Topic1 = <<"v1/cloud/bar1">>,
+    Topic2 = <<"v1/gateway/bar2">>,
+    ?assert(erlang:phash2(Topic1) rem 2 =/= erlang:phash2(Topic2) rem 2),
+    Message1 = emqx_message:make(ClientId1, 0, Topic1, <<"hello1">>),
+    Message2 = emqx_message:make(ClientId1, 0, Topic2, <<"hello2">>),
+    emqtt:subscribe(ConnPid1, {<<"$share/group1/v1/#">>, 0}),
+    emqtt:subscribe(ConnPid2, {<<"$share/group1/v1/#">>, 0}),
+    ct:sleep(100),
+    emqx:publish(Message1),
+    Me = self(),
+    WaitF = fun(ExpectedPayload) ->
+        case last_message(ExpectedPayload, [ConnPid1, ConnPid2]) of
+            {true, Pid} ->
+                Me ! {subscriber, Pid},
+                true;
+            Other ->
+                Other
+        end
+            end,
+    WaitF(<<"hello1">>),
+    UsedSubPid1 = receive {subscriber, P1} -> P1 end,
+    emqx_broker:publish(Message2),
+    WaitF(<<"hello2">>),
+    UsedSubPid2 = receive {subscriber, P2} -> P2 end,
+    ?assert(UsedSubPid1 =/= UsedSubPid2),
+    emqtt:stop(ConnPid1),
+    emqtt:stop(ConnPid2),
+    ok.
 %% if the original subscriber dies, change to another one alive
 t_not_so_sticky(_) ->
     ok = ensure_config(sticky),
@@ -324,6 +361,12 @@ ensure_config(Strategy) ->
 ensure_config(Strategy, AckEnabled) ->
     application:set_env(emqx, shared_subscription_strategy, Strategy),
     application:set_env(emqx, shared_dispatch_ack_enabled, AckEnabled),
+    ok.
+
+ensure_config(Strategy, AckEnabled, TopicParsePattern) ->
+    application:set_env(emqx, shared_subscription_strategy, Strategy),
+    application:set_env(emqx, shared_dispatch_ack_enabled, AckEnabled),
+    application:set_env(emqx, shared_sub_hash_topic_path_mapping, TopicParsePattern),
     ok.
 
 subscribed(Group, Topic, Pid) ->
